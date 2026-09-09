@@ -1,0 +1,15 @@
+{
+  "name": "autofile-concept",
+  "version": "1.0.0",
+  "private": true,
+  "description": "An AI note-taking app that files notes for you, and shows its work. Concept, build spec, and a working prototype.",
+  "scripts": {
+    "build:site": "node scripts/build-site.js",
+    "verify": "node scripts/verify.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "devDependencies": {
+    "marked": "^18.0.11"
+  },
+  "license": "MIT"
+}
