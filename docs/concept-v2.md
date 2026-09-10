@@ -42,7 +42,7 @@ An intelligent note application that classifies and files each note automaticall
 Naming these prevents the scope creep that kills solo projects:
 
 - **Not a task manager.** It extracts action items and surfaces them; it does not do dependencies, assignees, or sprints.
-- **Not a meeting recorder.** Transcription is a crowded, capital-intensive category with entrenched players. Autofile ingests transcripts; it does not capture audio.
+- **Not a transcription service.** Autofile records audio and ties it to what you were writing at the time, which is a navigation aid, not a transcript. Speech-to-text is a crowded, capital-intensive category with entrenched players, and competing there would be a different company.
 - **Not a wiki or knowledge base.** No page hierarchies, permissions matrices, or publishing.
 - **Not real-time collaborative.** Single-player first. Multiplayer changes the data model and triples the surface area.
 
