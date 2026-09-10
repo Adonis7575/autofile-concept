@@ -313,9 +313,17 @@ details.raw pre{background:var(--bg);border:1px solid var(--line);border-radius:
 .toast button{font-family:var(--mono);font-size:11.5px;color:var(--brand2)}
 .toast button:hover{text-decoration:underline}
 
-.banner{font-family:var(--mono);font-size:10px;color:var(--dim);padding:9px 15px;
+.banner{font-family:var(--mono);font-size:10px;color:var(--dim);padding:10px 15px;
   border-top:1px solid var(--line);line-height:1.6;background:var(--rail)}
-.banner a{color:var(--mid)}
+.acct{display:flex;flex-direction:column;gap:6px}
+.syncrow{display:flex;align-items:center;gap:7px}
+.sdot{width:6px;height:6px;border-radius:50%;background:var(--mid);flex:none}
+.sdot.ok{background:var(--ok)} .sdot.wait{background:var(--warn)} .sdot.off{background:var(--dim)}
+.linkbtn{font-family:var(--mono);font-size:10px;color:var(--brand2);text-align:left;padding:0}
+.linkbtn:hover{text-decoration:underline}
+.modal input.txtin{width:100%;background:var(--bg);border:1px solid var(--line2);border-radius:8px;
+  padding:10px 12px;color:var(--ink);font-family:var(--mono);font-size:13px;outline:none;margin-bottom:4px}
+.modal input.txtin:focus{border-color:var(--brandDim)}
 
 @media(max-width:1180px){.app{grid-template-columns:200px 250px minmax(0,1fr)}}
 .mobonly{display:none}
@@ -357,7 +365,10 @@ details.raw pre{background:var(--bg);border:1px solid var(--line);border-radius:
         <div id="rules"></div>
       </div>
     </div>
-    <p class="banner">Demo — classification runs in this page, nothing is sent anywhere and nothing persists on refresh.</p>
+    <div class="banner acct">
+      <div class="syncrow"><span class="sdot" id="sdot"></span><span id="sstat">Saved on this device</span></div>
+      <button class="linkbtn" id="bAuth">Sign in to sync</button>
+    </div>
   </aside>
 
   <!-- ─────── note list ─────── -->
@@ -645,6 +656,199 @@ if(typeof module!=="undefined") module.exports={classify,plain,FOLDERS,SEED,T_AU
 /* ==CLASSIFIER_END== */
 </script>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0/dist/umd/supabase.min.js"></script>
+<script>
+/* ═══════════ storage — local-first, Supabase when signed in ═══════════ */
+const SB_URL="https://lntodmvpdtilqubtzuuw.supabase.co";
+const SB_KEY="sb_publishable_85pSYDU629y1D8Hv7IUh3Q_RHg9Ypbb";
+const DB_NAME="autofile", DB_VER=1;
+const STORES=["notes","rules","folders","meta","queue","blobs"];
+
+const Store=(()=>{
+  let idb=null, sb=null, session=null, pushing=false;
+  const listeners=[];
+  const on=f=>listeners.push(f);
+  const emit=s=>listeners.forEach(f=>f(s));
+
+  /* ── IndexedDB ── */
+  function open(){
+    return new Promise((res,rej)=>{
+      const r=indexedDB.open(DB_NAME,DB_VER);
+      r.onupgradeneeded=()=>{
+        const d=r.result;
+        if(!d.objectStoreNames.contains("notes"))   d.createObjectStore("notes",{keyPath:"id"});
+        if(!d.objectStoreNames.contains("rules"))   d.createObjectStore("rules",{keyPath:"id"});
+        if(!d.objectStoreNames.contains("folders")) d.createObjectStore("folders",{keyPath:"id"});
+        if(!d.objectStoreNames.contains("meta"))    d.createObjectStore("meta");
+        if(!d.objectStoreNames.contains("blobs"))   d.createObjectStore("blobs");
+        if(!d.objectStoreNames.contains("queue"))   d.createObjectStore("queue",{autoIncrement:true});
+      };
+      r.onsuccess=()=>{idb=r.result;res(idb);};
+      r.onerror=()=>rej(r.error);
+    });
+  }
+  const tx=(s,mode)=>idb.transaction(s,mode).objectStore(s);
+  const wrap=req=>new Promise((res,rej)=>{req.onsuccess=()=>res(req.result);req.onerror=()=>rej(req.error);});
+  const put=(s,v,k)=>wrap(tx(s,"readwrite").put(v,k));
+  const get=(s,k)=>wrap(tx(s,"readonly").get(k));
+  const all=s=>wrap(tx(s,"readonly").getAll());
+  const del=(s,k)=>wrap(tx(s,"readwrite").delete(k));
+  const allKeys=s=>wrap(tx(s,"readonly").getAllKeys());
+
+  /* ── outbound queue ── */
+  async function enqueue(kind,id){
+    await put("queue",{kind,id,at:Date.now()});
+    schedulePush();
+  }
+  let pushTimer=null;
+  function schedulePush(){ clearTimeout(pushTimer); pushTimer=setTimeout(push,900); }
+
+  /* ── Supabase ── */
+  function client(){
+    if(sb) return sb;
+    if(typeof window.supabase==="undefined") return null;
+    sb=window.supabase.createClient(SB_URL,SB_KEY,{auth:{persistSession:true,autoRefreshToken:true}});
+    return sb;
+  }
+  async function initAuth(){
+    const c=client(); if(!c) return null;
+    const {data}=await c.auth.getSession();
+    session=data.session||null;
+    c.auth.onAuthStateChange((_e,s)=>{
+      const was=session&&session.user.id;
+      session=s||null;
+      emit(status());
+      if(session&&session.user.id!==was){ pull().then(push); }
+    });
+    return session;
+  }
+  const uid=()=>session?session.user.id:null;
+  const online=()=>navigator.onLine!==false;
+  const status=()=>({signedIn:!!session,email:session?session.user.email:null,
+                     online:online(),pending:pendingCount});
+  let pendingCount=0;
+
+  async function signIn(email){
+    const c=client(); if(!c) throw new Error("offline");
+    const {error}=await c.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin}});
+    if(error) throw error;
+  }
+  async function signOut(){ const c=client(); if(c) await c.auth.signOut(); session=null; emit(status()); }
+
+  const noteRow=(n,u)=>({id:n.id,user_id:u,title:n.title||"",html:n.html||"",
+    strokes:n.strokes||[],paper:n.paper||"ruled",light:!!n.light,path:n.path||"Inbox",
+    status:n.status||"needs_review",confidence:n.confidence,pinned:!!n.pinned,
+    decision:n.decision||null,audio:n.audio?{dur:n.audio.dur,marks:n.audio.marks,
+      mic:n.audio.mic,path:n.audio.path||null}:null,
+    updated_at:new Date(n.updated||Date.now()).toISOString(),
+    deleted_at:n.deleted?new Date(n.updated||Date.now()).toISOString():null});
+  const ruleRow=(r,u)=>({id:r.id,user_id:u,trigger:r.trigger,destination:r.destination,
+    hits:r.hits||0,active:r.active!==false,
+    updated_at:new Date(r.updated||Date.now()).toISOString(),
+    deleted_at:r.deleted?new Date(r.updated||Date.now()).toISOString():null});
+  const folderRow=(f,u)=>({id:f.id,user_id:u,path:f.path,tier:f.tier||2,position:f.position||0,
+    updated_at:new Date(f.updated||Date.now()).toISOString(),
+    deleted_at:f.deleted?new Date(f.updated||Date.now()).toISOString():null});
+
+  async function push(){
+    const c=client(), u=uid();
+    const q=await all("queue"); const keys=await allKeys("queue");
+    pendingCount=q.length; emit(status());
+    if(!c||!u||!online()||pushing||!q.length) return;
+    pushing=true;
+    try{
+      const seen=new Set(); const done=[];
+      for(let i=q.length-1;i>=0;i--){
+        const item=q[i], sig=item.kind+":"+item.id;
+        if(seen.has(sig)){ done.push(keys[i]); continue; }
+        seen.add(sig);
+        const rec=await get(item.kind==="note"?"notes":item.kind==="rule"?"rules":"folders",item.id);
+        if(!rec){ done.push(keys[i]); continue; }
+        const table=item.kind==="note"?"autofile_notes":item.kind==="rule"?"autofile_rules":"autofile_folders";
+        const row=item.kind==="note"?noteRow(rec,u):item.kind==="rule"?ruleRow(rec,u):folderRow(rec,u);
+        if(item.kind==="note"&&rec.audio&&!rec.audio.path){
+          const blob=await get("blobs",rec.id);
+          if(blob){
+            const p=`${u}/${rec.id}.webm`;
+            const {error}=await c.storage.from("autofile-audio").upload(p,blob,{upsert:true,contentType:"audio/webm"});
+            if(!error){ rec.audio.path=p; await put("notes",rec); row.audio=noteRow(rec,u).audio; }
+          }
+        }
+        const {error}=await c.from(table).upsert(row);
+        if(error) throw error;
+        done.push(keys[i]);
+      }
+      for(const k of done) await del("queue",k);
+      await put("meta",Date.now(),"lastPush");
+      pendingCount=(await all("queue")).length;
+    }catch(e){ /* stays queued; retried on next change or reconnect */ }
+    finally{ pushing=false; emit(status()); }
+  }
+
+  async function pull(){
+    const c=client(), u=uid();
+    if(!c||!u||!online()) return {notes:0,rules:0,folders:0};
+    const out={notes:0,rules:0,folders:0};
+    const since=(await get("meta","lastPull"))||"1970-01-01T00:00:00Z";
+    for(const [table,store,key] of [["autofile_notes","notes","notes"],
+        ["autofile_rules","rules","rules"],["autofile_folders","folders","folders"]]){
+      const {data,error}=await c.from(table).select("*").gt("updated_at",since);
+      if(error||!data) continue;
+      for(const row of data){
+        const local=await get(store,row.id);
+        const remoteAt=new Date(row.updated_at).getTime();
+        if(local&&(local.updated||0)>remoteAt) continue;   // local edit is newer
+        const rec=fromRow(store,row);
+        await put(store,rec); out[key]++;
+      }
+    }
+    await put("meta",new Date().toISOString(),"lastPull");
+    return out;
+  }
+  function fromRow(store,row){
+    const base={id:row.id,updated:new Date(row.updated_at).getTime(),deleted:!!row.deleted_at};
+    if(store==="notes") return {...base,title:row.title,html:row.html,strokes:row.strokes||[],
+      paper:row.paper,light:row.light,path:row.path,status:row.status,confidence:row.confidence,
+      pinned:row.pinned,decision:row.decision,audio:row.audio};
+    if(store==="rules") return {...base,trigger:row.trigger,destination:row.destination,
+      hits:row.hits,active:row.active};
+    return {...base,path:row.path,tier:row.tier,position:row.position};
+  }
+
+  async function logClassification(noteId,d,engine,latency){
+    const c=client(), u=uid(); if(!c||!u||!online()) return;
+    try{
+      await c.from("autofile_classifications").insert({user_id:u,note_id:noteId,engine,
+        model:d.model||null,prompt_version:d.prompt_version||null,destination:d.destination,
+        confidence:d.confidence,reasons:d.reasons||[],alternatives:d.alternatives||[],
+        applied_path:d.applied,decided_by:d.decided_by,latency_ms:latency||null});
+    }catch(e){}
+  }
+  async function logCorrection(noteId,from,to,kind){
+    const c=client(), u=uid(); if(!c||!u||!online()) return;
+    try{ await c.from("autofile_corrections").insert({user_id:u,note_id:noteId,
+      from_path:from,to_path:to,kind}); }catch(e){}
+  }
+  async function audioURL(note){
+    const local=await get("blobs",note.id);
+    if(local) return URL.createObjectURL(local);
+    const c=client(); if(!c||!note.audio||!note.audio.path) return null;
+    try{
+      const {data,error}=await c.storage.from("autofile-audio").download(note.audio.path);
+      if(error||!data) return null;
+      await put("blobs",data,note.id);
+      return URL.createObjectURL(data);
+    }catch(e){ return null; }
+  }
+
+  addEventListener("online",()=>{ emit(status()); push(); });
+  addEventListener("offline",()=>emit(status()));
+
+  return {open,put,get,all,del,enqueue,push,pull,initAuth,signIn,signOut,status,on,
+          logClassification,logCorrection,audioURL,uid,client};
+})();
+</script>
+
 <script>
 /* ═══════════ state ═══════════ */
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -654,7 +858,7 @@ const COLORS=["#8b8cf0","#6ee7a8","#e6b450","#e8836c","#e9e7e4"];
 const WIDTHS=[1.6,3.2,6];
 
 const state={folders:[...FOLDERS],notes:[],rules:[],activeId:null,subject:null,query:"",
-  tool:"text",color:COLORS[0],width:WIDTHS[1],lastOp:null,
+  tool:"text",color:COLORS[0],width:WIDTHS[1],lastOp:null,folderMeta:new Map(),
   rec:{on:false,t0:0,dur:0,pos:0,playing:false,url:null,mic:false,mr:null,chunks:[],el:null,timer:null}};
 
 const preview=n=>plain(n).split("\n").slice(1).join(" ").trim().slice(0,140);
@@ -663,11 +867,36 @@ const ago=t=>{const m=(Date.now()-t)/6e4;
   if(m<1)return"just now"; if(m<60)return Math.floor(m)+"m ago";
   if(m<1440)return Math.floor(m/60)+"h ago"; return Math.floor(m/1440)+"d ago";};
 
-/* ═══════════ seed ═══════════ */
-SEED.forEach(([t,b,p],i)=>state.notes.push({
-  id:"s"+i,title:t,html:"<p>"+esc(b)+"</p>",strokes:[],paper:"ruled",light:false,
-  path:p,status:"auto",confidence:null,decision:null,audio:null,
-  updated:Date.now()-(SEED.length-i)*36e5}));
+/* ═══════════ persistence ═══════════ */
+const strip=n=>{const{__plain,__pv,__pt,...rest}=n;return rest;};
+let saveTimer=null, dirty=new Set();
+function markDirty(n){ if(!n)return; n.updated=Date.now(); dirty.add(n.id);
+  clearTimeout(saveTimer); saveTimer=setTimeout(flush,500); }
+async function flush(){
+  for(const id of [...dirty]){
+    const n=state.notes.find(x=>x.id===id); dirty.delete(id);
+    if(!n) continue;
+    try{ await Store.put("notes",strip(n)); Store.enqueue("note",n.id); }catch(e){}
+  }
+}
+async function saveNow(n){ if(!n)return; dirty.delete(n.id);
+  try{ await Store.put("notes",strip(n)); Store.enqueue("note",n.id); }catch(e){} }
+async function saveRule(r){ try{ await Store.put("rules",{...r}); Store.enqueue("rule",r.id); }catch(e){} }
+async function saveFolders(){
+  for(let i=0;i<state.folders.length;i++){
+    const path=state.folders[i];
+    let m=state.folderMeta.get(path);
+    if(!m){ m={id:uid(),path,tier:i<10?1:2,position:i,updated:Date.now()}; state.folderMeta.set(path,m); }
+    m.position=i; m.path=path; m.updated=Date.now();
+    try{ await Store.put("folders",{...m}); Store.enqueue("folder",m.id); }catch(e){}
+  }
+}
+function seedNotes(){
+  SEED.forEach(([t,b,p],i)=>state.notes.push({
+    id:"s"+i,title:t,html:"<p>"+esc(b)+"</p>",strokes:[],paper:"ruled",light:false,
+    path:p,status:"auto",confidence:null,decision:null,audio:null,pinned:false,
+    updated:Date.now()-(SEED.length-i)*36e5}));
+}
 
 const note=()=>state.notes.find(n=>n.id===state.activeId);
 const decisionFor=n=>n.decision||(n.decision=classify(n,state));
@@ -720,6 +949,11 @@ function renameSubject(path,el){
       state.notes.forEach(n=>{if(n.path===path)n.path=v;});
       state.rules.forEach(r=>{if(r.destination===path)r.destination=v;});
       if(state.subject===path)state.subject=v;
+      const meta=state.folderMeta.get(path);
+      if(meta){state.folderMeta.delete(path);meta.path=v;state.folderMeta.set(v,meta);}
+      saveFolders();
+      state.notes.forEach(n=>{if(n.path===v)saveNow(n);});
+      state.rules.forEach(r=>{if(r.destination===v)saveRule(r);});
       toast(`Renamed to ${v}`);
     }
     renderAll();
@@ -740,7 +974,10 @@ function renderRules(){
   $$("#rules [data-rule]").forEach(b=>b.onclick=()=>{
     const r=state.rules[+b.dataset.rule];
     state.rules.splice(+b.dataset.rule,1);
-    renderRules(); toast(`Rule removed — ${r.trigger}`,"Undo",()=>{state.rules.push(r);renderRules();});
+    saveRule({...r,deleted:true,updated:Date.now()});
+    renderRules();
+    toast(`Rule removed — ${r.trigger}`,"Undo",()=>{
+      state.rules.push(r); saveRule({...r,deleted:false,updated:Date.now()}); renderRules();});
   });
 }
 
@@ -794,10 +1031,11 @@ function renderWhy(){
   const cls=d.confidence>=T_AUTO?"c-ok":d.confidence>=T_FLAG?"c-warn":"c-rev";
   const shown={destination:d.destination,confidence:d.confidence,document_type:d.document_type,
     entities:d.entities,temporal:d.temporal,tags:d.tags,reasons:d.reasons,
-    alternatives:d.alternatives,decided_by:d.decided_by};
+    alternatives:d.alternatives,decided_by:d.decided_by,engine:d.engine||"local",
+    model:d.model,latency_ms:d.latency};
   b.innerHTML=`
     <div class="dest">${esc(n.path)}</div>
-    <div class="destsub">${esc(d.decided_by)} · <span class="conf ${cls}">${d.confidence.toFixed(2)}</span></div>
+    <div class="destsub">${esc(d.decided_by)} · ${esc(d.engine==="haiku"?(d.model||"claude haiku"):d.engine==="rule"?"your rule":"local classifier")}${d.latency?" · "+d.latency+"ms":""} · <span class="conf ${cls}">${d.confidence.toFixed(2)}</span></div>
     ${d.reasons.map(r=>`<div class="rsn"><i>✓</i><span>${esc(r)}</span></div>`).join("")}
     ${d.alternatives.length?`<div class="alts">
       <h4 style="font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:var(--dim);margin:0 0 8px">Also considered</h4>
@@ -812,7 +1050,9 @@ function renderWhy(){
       <pre>${esc(JSON.stringify(shown,null,2))}</pre></details>`;
   $$("#whyBody [data-alt]").forEach(x=>x.onclick=()=>moveNote(n,x.dataset.alt,null,false));
   $("#bMove").onclick=()=>openMove(n);
-  $("#bOk").onclick=()=>{n.status="pinned";toast("Marked correct — logged as a positive label");renderCards();renderStamp();};
+  $("#bOk").onclick=()=>{n.status="pinned";saveNow(n);
+    Store.logCorrection(n.id,n.path,n.path,"confirm");
+    toast("Marked correct — logged as a positive label");renderCards();renderStamp();};
 }
 
 const renderAll=()=>{renderSubjects();renderRules();renderCards();renderStamp();renderWhy();};
@@ -838,18 +1078,68 @@ function openNote(id){
 
 function touch(){
   const n=note(); if(!n)return;
-  n.title=titleEl.value; n.html=txt.innerHTML; n.updated=Date.now();
+  n.title=titleEl.value; n.html=txt.innerHTML; markDirty(n);
   if(state.rec.on) stampBlock();
   clearTimeout(fileTimer);
   fileTimer=setTimeout(()=>fileNote(n),900);
   renderCards(); renderStamp();
 }
 
-function fileNote(n){
+/* The policy layer lives here, in code, for BOTH engines — the model proposes a
+   destination, this decides. A destination that isn't a real subject is dropped,
+   which is what stops a pasted "ignore previous instructions" from choosing one. */
+function policy(d){
+  const valid=state.folders.includes(d.destination);
+  let applied=d.destination,status="needs_review",decided_by="needs_review";
+  if(valid&&d.confidence>=T_AUTO){status="auto";decided_by="auto";}
+  else if(valid&&d.confidence>=T_FLAG){status="auto_flagged";decided_by="auto_flagged";}
+  else applied="Inbox";
+  return {...d,applied,status,decided_by};
+}
+function neighboursFor(n){
+  const others=state.notes.filter(x=>x.id!==n.id);
+  if(!others.length) return [];
+  const idx=buildIndex(others), v=vec(tokenize(plain(n)),idx);
+  return others.map(x=>({title:x.title,path:x.path,sim:cosine(v,vec(tokenize(plain(x)),idx))}))
+    .filter(x=>x.sim>.04).sort((a,b)=>b.sim-a.sim).slice(0,5);
+}
+function ruleHit(n){
+  const text=plain(n), ents=findEntities(text);
+  for(const r of state.rules)
+    if(ents.some(e=>e.toLowerCase()===r.trigger.toLowerCase()))
+      return {destination:r.destination,applied:r.destination,confidence:.99,decided_by:"rule",
+        status:"auto",document_type:detectType(text),temporal:detectTemporal(text),entities:ents,
+        tags:ents.slice(0,2).map(slug),
+        reasons:[`Matches your rule: ${r.trigger} → ${r.destination}`],alternatives:[]};
+  return null;
+}
+async function classifyRemote(n){
+  const ctrl=new AbortController(), to=setTimeout(()=>ctrl.abort(),9000);
+  try{
+    const r=await fetch("/api/classify",{method:"POST",signal:ctrl.signal,
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({note:plain(n),folders:state.folders,
+        rules:state.rules.map(x=>({trigger:x.trigger,destination:x.destination})),
+        neighbours:neighboursFor(n)})});
+    if(r.status===501){ state.remote=false; return null; }   // no key: stop asking
+    if(!r.ok) return null;
+    const d=await r.json();
+    return d&&d.destination?d:null;
+  }catch(e){ return null; }
+  finally{ clearTimeout(to); }
+}
+async function fileNote(n){
   if(plain(n).trim().length<20){renderWhy();return;}
-  const d=classify(n,state);
+  let d=ruleHit(n), engine="rule";
+  if(!d&&state.remote!==false){
+    const rd=await classifyRemote(n);
+    if(rd){ d=policy(rd); engine="haiku"; }
+  }
+  if(!d){ d=classify(n,state); engine=d.decided_by==="rule"?"rule":"local"; }
+  d.engine=engine;
   n.decision=d;
   if(!n.pinned){ n.path=d.applied; n.status=d.status; n.confidence=d.confidence; }
+  saveNow(n); Store.logClassification(n.id,d,engine,d.latency);
   renderAll();
 }
 
@@ -979,7 +1269,7 @@ function eraseAt(x,y){
     if(s.pts.length===1&&Math.hypot(s.pts[0][0]-x,s.pts[0][1]-y)<r)return false;
     return true;
   });
-  if(n.strokes.length!==before){ n.updated=Date.now(); redraw(); renderStamp(); }
+  if(n.strokes.length!==before){ markDirty(n); redraw(); renderStamp(); }
 }
 cvs.addEventListener("pointerdown",e=>{
   if(state.tool==="text")return;
@@ -999,7 +1289,7 @@ cvs.addEventListener("pointermove",e=>{
 function endStroke(){
   if(!drawing)return;
   const n=note();
-  if(!drawing.erase&&n&&drawing.pts.length){ n.strokes.push(drawing); n.updated=Date.now(); }
+  if(!drawing.erase&&n&&drawing.pts.length){ n.strokes.push(drawing); markDirty(n); }
   drawing=null; redraw(); renderStamp(); renderCards();
 }
 cvs.addEventListener("pointerup",endStroke);
@@ -1030,10 +1320,10 @@ $$("#widths [data-w]").forEach(b=>b.onclick=()=>{
 });
 
 /* paper */
-$("#paper").onchange=e=>{const n=note();if(!n)return;n.paper=e.target.value;page.dataset.paper=n.paper;};
+$("#paper").onchange=e=>{const n=note();if(!n)return;n.paper=e.target.value;page.dataset.paper=n.paper;markDirty(n);};
 $("#bTheme").onclick=()=>{const n=note();if(!n)return;
   n.light=!n.light;page.classList.toggle("light",n.light);
-  $("#bTheme").classList.toggle("on",n.light);};
+  $("#bTheme").classList.toggle("on",n.light);markDirty(n);};
 
 new ResizeObserver(()=>sizeCanvas()).observe(page);
 </script>
@@ -1069,7 +1359,8 @@ function loadAudio(n){
   stopPlay();
   if(!n.audio&&!rec.on){bar.hidden=true;return;}
   bar.hidden=false; bar.classList.toggle("live",rec.on);
-  rec.pos=0; rec.url=n.audio?n.audio.url:null;
+  rec.pos=0; rec.url=null;
+  if(n.audio) Store.audioURL(n).then(u=>{ if(note()===n) rec.url=u; });
   $("#recNote").textContent=n.audio&&!n.audio.mic?"timeline only — no mic":"";
   marksHTML(n); tick();
 }
@@ -1082,7 +1373,7 @@ async function startRec(){
     rec.mr.ondataavailable=e=>rec.chunks.push(e.data);
     rec.mr.onstop=()=>{ st.getTracks().forEach(t=>t.stop());
       const b=new Blob(rec.chunks,{type:"audio/webm"});
-      if(b.size)rec.url=URL.createObjectURL(b); finishRec(); };
+      if(b.size){ rec.blob=b; rec.url=URL.createObjectURL(b); } finishRec(); };
     rec.mr.start();
   }catch(e){ rec.mr=null; }
   bar.hidden=false; bar.classList.add("live");
@@ -1095,8 +1386,9 @@ function finishRec(){
   const dur=(performance.now()-rec.t0)/1000;
   const marks=$$("#txt [data-rec]").map(e=>+e.dataset.rec)
     .concat(n.strokes.filter(s=>s.t!==undefined).map(s=>s.t)).sort((a,b)=>a-b);
-  n.audio={dur,url:rec.url,mic:rec.mic,marks};
+  n.audio={dur,mic:rec.mic,marks};
   n.html=txt.innerHTML;
+  if(rec.blob){ Store.put("blobs",rec.blob,n.id).then(()=>saveNow(n)); } else saveNow(n);
   rec.on=false; clearInterval(rec.timer); rec.timer=null;
   bar.classList.remove("live"); $("#bRec").classList.remove("rec");
   $("#recLabel").textContent="Record"; $("#recNote").textContent=rec.mic?"":"timeline only — no mic";
@@ -1115,7 +1407,7 @@ function stopPlay(){
 function play(){
   const n=note(); if(!n||!n.audio)return;
   rec.playing=true; $("#bPlay").classList.add("on");
-  if(n.audio.url){ rec.el=new Audio(n.audio.url); rec.el.currentTime=rec.pos;
+  if(rec.url){ rec.el=new Audio(rec.url); rec.el.currentTime=rec.pos;
     rec.el.play().catch(()=>{}); rec.el.onended=stopPlay; }
   const t0=performance.now(), base=rec.pos;
   rec.timer=setInterval(()=>{
@@ -1181,20 +1473,24 @@ function moveNote(n,dest,ruleEnt,past){
     entities:(n.decision||{}).entities||[],tags:[],
     document_type:(n.decision||{}).document_type||"other",temporal:"evergreen"};
   let rule=null;
-  if(ruleEnt){rule={trigger:ruleEnt,destination:dest,hits:0};state.rules.push(rule);}
+  if(ruleEnt){rule={id:uid(),trigger:ruleEnt,destination:dest,hits:0,updated:Date.now()};
+    state.rules.push(rule); saveRule(rule);}
   if(past&&ruleEnt) state.notes.forEach(x=>{
     if(x.id!==n.id&&x.path!==dest&&plain(x).toLowerCase().includes(ruleEnt.toLowerCase())){
       undo.push([x.id,{path:x.path,status:x.status,pinned:x.pinned,decision:x.decision}]);
       x.path=dest;x.status="pinned";x.pinned=true;x.decision=null;}});
   state.lastOp={undo,rule};
+  Store.logCorrection(n.id,undo[0][1].path,dest,"move");
+  undo.forEach(([id])=>{const x=state.notes.find(y=>y.id===id); if(x) saveNow(x);});
   renderAll();
   toast(ruleEnt?`Rule created — ${ruleEnt} → ${dest}`:`Moved to ${dest}`,"Undo",undoLast);
 }
 function undoLast(){
   const op=state.lastOp; if(!op)return;
   op.undo.forEach(([id,s])=>{const n=state.notes.find(x=>x.id===id);
-    if(n)Object.assign(n,s);});
-  if(op.rule)state.rules=state.rules.filter(r=>r!==op.rule);
+    if(n){Object.assign(n,s); saveNow(n);}});
+  if(op.rule){state.rules=state.rules.filter(r=>r!==op.rule);
+    saveRule({...op.rule,deleted:true,updated:Date.now()});}
   state.lastOp=null; renderAll(); toast("Undone");
 }
 function delNote(){
@@ -1207,17 +1503,19 @@ function delNote(){
   $("#mDel").onclick=()=>{
     hideModal();
     const i=state.notes.indexOf(n); state.notes.splice(i,1);
+    n.deleted=true; saveNow(n);
     const nx=state.notes[Math.min(i,state.notes.length-1)];
     state.activeId=null; if(nx)openNote(nx.id); else newNote();
     renderAll();
     toast(`Deleted “${n.title||"Untitled"}”`,"Undo",()=>{
-      state.notes.splice(i,0,n); openNote(n.id); renderAll(); toast("Restored");});
+      n.deleted=false; state.notes.splice(i,0,n); saveNow(n);
+      openNote(n.id); renderAll(); toast("Restored");});
   };
 }
 function newNote(){
   const n={id:uid(),title:"",html:"<p><br></p>",strokes:[],paper:$("#paper").value||"ruled",light:false,
-    path:"Inbox",status:"needs_review",confidence:null,decision:null,audio:null,updated:Date.now()};
-  state.notes.push(n); state.subject=null; state.query=""; $("#q").value="";
+    path:"Inbox",status:"needs_review",confidence:null,decision:null,audio:null,pinned:false,updated:Date.now()};
+  state.notes.push(n); saveNow(n); state.subject=null; state.query=""; $("#q").value="";
   openNote(n.id); renderAll(); titleEl.focus();
 }
 $("#bNew").onclick=newNote;
@@ -1273,13 +1571,89 @@ document.addEventListener("keydown",e=>{
 });
 window.addEventListener("resize",sizeCanvas);
 
+/* ═══════════ sync surface ═══════════ */
+function renderSync(st){
+  const dot=$("#sdot"), lab=$("#sstat"), btn=$("#bAuth");
+  if(!dot)return;
+  dot.className="sdot "+(!st.online?"off":st.signedIn?(st.pending?"wait":"ok"):"");
+  lab.textContent = !st.online ? "Offline — saved here, will sync"
+    : st.signedIn ? (st.pending? `Syncing ${st.pending} change${st.pending===1?"":"s"}…` : "Synced")
+    : "Saved on this device";
+  btn.textContent = st.signedIn ? `Sign out (${st.email||"signed in"})` : "Sign in to sync";
+  btn.onclick = st.signedIn
+    ? ()=>{ Store.signOut().then(()=>toast("Signed out — your notes stay on this device")); }
+    : askEmail;
+}
+function askEmail(){
+  $("#modal").innerHTML=`<h4>Sync across devices</h4>
+    <p>Your notes already save on this machine. Sign in and they follow you —
+       we send a one-time link, no password.</p>
+    <input class="txtin" id="mEmail" type="email" placeholder="you@example.com" autocomplete="email">
+    <div class="mrow"><button class="ghost" data-close>Not now</button>
+      <button class="go" id="mSend">Send link</button></div>`;
+  showModal(); setTimeout(()=>$("#mEmail").focus(),50);
+  const go=async()=>{
+    const em=$("#mEmail").value.trim();
+    if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) return toast("That doesn't look like an email address");
+    $("#mSend").textContent="Sending…"; $("#mSend").disabled=true;
+    try{ await Store.signIn(em); hideModal();
+      toast(`Link sent to ${em} — open it on any device`); }
+    catch(e){ hideModal(); toast("Couldn't send the link: "+(e.message||"try again")); }
+  };
+  $("#mSend").onclick=go;
+  $("#mEmail").onkeydown=e=>{ if(e.key==="Enter") go(); };
+}
+async function reloadFromDisk(){
+  const notes=(await Store.all("notes")).filter(n=>!n.deleted);
+  const keep=state.activeId;
+  state.notes=notes.sort((a,b)=>a.updated-b.updated);
+  state.rules=(await Store.all("rules")).filter(r=>!r.deleted);
+  const fs=(await Store.all("folders")).filter(f=>!f.deleted);
+  if(fs.length){ fs.sort((a,b)=>a.position-b.position);
+    state.folders=fs.map(f=>f.path); state.folderMeta=new Map(fs.map(f=>[f.path,f])); }
+  renderAll();
+  if(state.notes.some(n=>n.id===keep)) openNote(keep);
+  else if(state.notes.length) openNote(state.notes[state.notes.length-1].id);
+}
+
 /* ═══════════ boot ═══════════ */
-try{document.execCommand("defaultParagraphSeparator",false,"p");}catch(e){}
-setTool("text");
-renderAll();
-openNote(state.notes[state.notes.length-1].id);
-state.notes.forEach(n=>{ if(!n.decision) n.decision=classify(n,state); });
-renderAll();
+async function boot(){
+  try{document.execCommand("defaultParagraphSeparator",false,"p");}catch(e){}
+  setTool("text");
+  let stored=false;
+  try{
+    await Store.open();
+    await Store.initAuth();
+    const seeded=await Store.get("meta","seeded");
+    const notes=(await Store.all("notes")).filter(n=>!n.deleted);
+    if(notes.length){ state.notes=notes.sort((a,b)=>a.updated-b.updated); }
+    else if(!seeded){
+      seedNotes();
+      for(const n of state.notes) await Store.put("notes",strip(n));
+      await Store.put("meta",Date.now(),"seeded");
+    }
+    state.rules=(await Store.all("rules")).filter(r=>!r.deleted);
+    const fs=(await Store.all("folders")).filter(f=>!f.deleted);
+    if(fs.length){ fs.sort((a,b)=>a.position-b.position);
+      state.folders=fs.map(f=>f.path); state.folderMeta=new Map(fs.map(f=>[f.path,f])); }
+    await saveFolders();
+    stored=true;
+  }catch(e){
+    if(!state.notes.length) seedNotes();
+    setTimeout(()=>toast("Storage is blocked in this browser — this session won't be saved"),800);
+  }
+  if(!state.notes.length){ seedNotes(); if(stored) for(const n of state.notes) Store.put("notes",strip(n)); }
+  renderAll();
+  openNote(state.notes[state.notes.length-1].id);
+  state.notes.forEach(n=>{ if(!n.decision) n.decision=classify(n,state); });
+  renderAll();
+  if(stored){
+    Store.on(renderSync); renderSync(Store.status());
+    if(Store.uid()){ try{ await Store.pull(); await reloadFromDisk(); Store.push(); }catch(e){} }
+  }
+  addEventListener("beforeunload",()=>{ flush(); });
+}
+boot();
 </script>
 </body>
 </html>

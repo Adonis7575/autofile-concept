@@ -7,67 +7,93 @@ filing happens on its own and shows you why.
 
 | | |
 |---|---|
-| [`/`](https://autofile-concept.vercel.app) · `index.html` | The app. Open it in a browser. No server, no API key, no build |
+| [`/`](https://autofile-concept.vercel.app) · `index.html` | The app |
 | [`/concept`](https://autofile-concept.vercel.app/concept) · `docs/concept-v2.md` | The product concept — what it is, what it refuses to be, and why |
-| [`/spec`](https://autofile-concept.vercel.app/spec) · `docs/build-spec.md` | How to build it for real: schema, pipeline, eval harness, six-week plan |
-| `scripts/verify.js` | Runs the classifier headlessly — accuracy and calibration |
-| `scripts/smoke.js` | Drives the whole UI in headless Chromium — 63 checks |
-| `scripts/build-site.js` | Renders the markdown docs into the committed HTML pages |
-
-## Running it
+| [`/spec`](https://autofile-concept.vercel.app/spec) · `docs/build-spec.md` | The implementation plan this was built from |
+| `api/classify.js` | Serverless route: one Claude Haiku call with structured output |
+| `scripts/verify.js` | Classifier accuracy and calibration, headless |
+| `scripts/smoke.js` | Drives the whole UI in Chromium — 77 checks |
+| `scripts/serve.js` | Local dev server (IndexedDB and `/api` need a real origin) |
 
 ```bash
-open index.html            # the app needs nothing
-
 npm install
-npm run verify             # classifier accuracy + calibration
-npm run smoke              # every button, tool, and gesture
-npm run build:site         # rebuild concept.html / spec.html after editing docs
+npm run dev        # http://127.0.0.1:8099
+npm run verify     # classifier accuracy + calibration
+npm run smoke      # every button, tool, gesture, and the persistence paths
 ```
 
-## What it does
+## Writing
 
-**Writing surface.** Rich text with headings, bullets, checklists, quotes, inline
-code and highlight. Enter inside a checklist makes the next item; an empty one
-drops you back to prose.
+Rich text — headings, bullets, checklists, quotes, inline code, highlight. Enter
+inside a checklist makes the next item; an empty one drops you back to prose.
 
-**Ink.** Pen, highlighter and eraser on a pressure-aware canvas layered over the
-text. Five colours, three widths. The eraser removes whole strokes rather than
-scrubbing pixels, so nothing is left half-deleted. Strokes are stored as point
-arrays, which is why they survive switching notes and redraw crisply on resize.
+**Ink.** Pen, highlighter and eraser on a pressure-aware canvas over the text.
+The eraser removes whole strokes rather than scrubbing pixels. Strokes are point
+arrays, so they survive note switches and redraw crisply on resize.
 
 **Paper.** Plain, ruled, grid or dotted, per note, on a slate or cream page.
 
-**Audio, tied to what you wrote.** Record while you write and every line and
-stroke gets a timestamp. Play back and the line you were writing lights up;
-click any line to jump to that moment. Marks show on the scrubber. If the mic
-is unavailable the timeline still runs and says so rather than pretending.
+**Audio.** Record while you write and every line and stroke gets a timestamp.
+Play back and the line you were writing lights up; click any line to jump to that
+moment. If the mic is unavailable the timeline still runs and says so.
 
-**Filing, which is the point.** Every note is classified as you pause — subject,
-confidence, evidence. Low confidence goes to Inbox rather than into a folder you
-would never check. "Why here?" shows the reasoning and the runners-up. Move a
-note and it offers to make that a standing rule, which you can delete from the
-rail. Subjects rename in place by double-clicking.
+## Filing
 
-## What's real and what isn't
+Every note is classified as you pause — subject, confidence, evidence. There are
+three engines, in order:
 
-**Real:** the ink engine, the audio timeline, the editor, the decision cascade,
-the confidence tiers, the Inbox fallback, the evidence list, the rules loop, undo
-on every destructive action, and the destination validation that stops a pasted
-"ignore previous instructions" from choosing a folder.
+1. **Your rules.** A learned rule short-circuits everything, costs nothing, and
+   never leaves the browser.
+2. **Claude Haiku,** via `/api/classify` — the real call from the spec, with
+   tool-use structured output and the note delimited as untrusted data.
+3. **The local classifier** — TF-IDF over your own notes plus entity evidence.
+   It runs when there's no API key, when the call fails, and when you're offline.
 
-**Simulated:** the classifier. In place of one Claude Haiku call it runs TF-IDF
-cosine similarity over your own corpus plus keyword and entity evidence — same
-output shape, same policy layer, no network. The gap between the two is the
-honest argument for spending $0.003 a note.
+The panel names which one decided, and the model and latency when it was Haiku.
 
-**In memory only.** Nothing persists across a refresh. That is one Postgres table
-away in the real build (`docs/build-spec.md` §2) and deliberately out of scope here.
+**The policy layer is in code, shared by all three.** The model proposes a
+destination; the client decides. A destination that isn't one of your real
+subjects is dropped and the note goes to Inbox — which is what stops a pasted
+"ignore previous instructions" from choosing where your note lands. There's a
+test for exactly that.
+
+## Storage
+
+**Local-first.** Notes, ink, audio and rules are written to IndexedDB as you
+type. Close the tab, kill the browser, go offline — it's all still there.
+
+**Sync is optional.** Signed out, the app is complete and private to that
+machine. Sign in with a one-time email link and everything syncs to Postgres and
+follows you to another device. Writes queue while offline and drain on reconnect;
+conflicts resolve last-write-wins on `updated_at`.
+
+Ids are generated on the client, so a note created offline keeps its identity
+when it syncs — no remapping on reconnect. Audio blobs live in IndexedDB and
+upload to private object storage keyed by user id.
+
+Every table has row-level security scoped to `auth.uid()`, granted only to
+`authenticated`. The anon role has no policy at all, so a leaked publishable key
+reads nothing.
+
+`autofile_classifications` and `autofile_corrections` are append-only. Every
+decision and every correction is recorded — that is the eval set from the spec,
+and it is what lets you replay a prompt change against real history.
+
+## Configuration
+
+The app runs with no configuration at all — local classifier, local storage.
+
+| Variable | Where | Effect if unset |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Vercel project env | `/api/classify` returns 501 and the client silently uses the local classifier |
+
+Supabase URL and publishable key are compiled into `index.html`. That is correct
+for a publishable key: it identifies the project, and RLS does the enforcing.
 
 ## Measured (`npm run verify`)
 
 ```
-leave-one-out over the seeded corpus
+leave-one-out over the seeded corpus, local classifier
 accuracy   79%          inbox rate  17%          n = 29
 
 calibration (predicted → actual)
@@ -78,30 +104,14 @@ calibration (predicted → actual)
   0.9   n=16   94%
 ```
 
-Read the 0.9 row: notes the demo calls 90% confident are right 94% of the time,
-so the number on screen means roughly what it says. That is the property the
-whole transparency story rests on, and the metric to defend when a real model
-replaces this one.
+Notes the local classifier calls 90% confident are right 94% of the time, so the
+number on screen means roughly what it says. With a key configured the same
+harness can be pointed at Haiku to compare the two on identical inputs.
 
 Two misses are left in on purpose: `Archive` holds one note, so leave-one-out can
 never place it, and "Marcus working style" files under `Projects/Acme Redesign`
 because Marcus appears in three Acme notes — a defensible wrong answer, and the
 best thing in the app to correct.
-
-## The 90-second demo
-
-1. **New note.** Type a couple of lines about a client. Watch the stamp under the
-   title fill in a subject and a confidence a moment after you stop.
-2. **Why here?** Four pieces of evidence, the runners-up, and the raw decision
-   object underneath.
-3. **Pen.** Draw over the text. Switch to the highlighter, then erase a stroke.
-   Change the paper to grid, or flip the page to cream.
-4. **Record.** Write two lines while it runs, stop, then press play and click the
-   first line — the audio jumps to the moment you wrote it.
-5. **Move a note** and keep "always file notes mentioning X here". Write another
-   note naming X and it goes straight there. Then delete the rule from the rail.
-
-Step 5 is the thesis. Step 4 is the one people remember.
 
 ---
 
